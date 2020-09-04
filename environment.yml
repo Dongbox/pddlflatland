@@ -1,5 +1,5 @@
 
-name : pddlgym
+name : pddlflatland
 dependencies:
   - python=3
   - pip
