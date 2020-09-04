@@ -15,8 +15,12 @@ Please see [our paper](https://arxiv.org/abs/2002.06432) describing the design d
 **We support the following subset of PDDL1.2:**
 - STRIPS
 - Typing (including hierarchical)
+- Quantifiers (forall, exists)
+- Disjunctions (or)
+- Equality
+- Constants
 
-Notable features that we do not currently support include equality (blocked by: parsing and inference), conditional effects (blocked by: inference), disjunction and quantification (blocked by: inference).
+Notable features that we do not currently support: conditional effects, action costs, derived predicates.
 
 Several PDDL environments are included, such as:
 - Sokoban
@@ -24,6 +28,12 @@ Several PDDL environments are included, such as:
 - Blocks
 - Keys and Doors
 - Towers of Hanoi
+- Snake
+- Fridge
+- Gripper
+- Ferry
+- Elevator
+- TSP
 - "Minecraft"
 - "Rearrangement"
 - "Travel"

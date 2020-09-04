@@ -3,18 +3,46 @@
 
 from collections import defaultdict
 from copy import deepcopy
+from pddlgym.prolog_interface import PrologInterface
+from pddlgym.structs import Literal, LiteralConjunction
 
 
 def find_satisfying_assignments(kb, conds, variable_sort_fn=None, verbose=False, 
                                 max_assignment_count=2, type_to_parent_types=None,
-                                allow_redundant_variables=True):
-    return ProofSearchTree(kb,
+                                allow_redundant_variables=True, constants=None,
+                                mode="csp"):
+    if mode == "csp":
+        return ProofSearchTree(kb,
+            allow_redundant_variables=allow_redundant_variables,
+            type_to_parent_types=type_to_parent_types,
+            constants=constants,
+            ).prove(list(conds), 
+            max_assignment_count=max_assignment_count, 
+            variable_sort_fn=variable_sort_fn,
+            verbose=verbose)
+    assert mode == "prolog"
+    assert all(len(v) == 1 for v in type_to_parent_types.values()), \
+        "TODO: implement support for hierarchical types in prolog inference"
+    prolog_interface = PrologInterface(kb, conds,
+        max_assignment_count=max_assignment_count,
         allow_redundant_variables=allow_redundant_variables,
-        type_to_parent_types=type_to_parent_types).prove(list(conds), 
-        max_assignment_count=max_assignment_count, 
-        variable_sort_fn=variable_sort_fn,
-        verbose=verbose)
+        constants=constants)
+    return prolog_interface.run()
 
+def check_goal(state, goal):
+    if isinstance(goal, Literal):
+        if goal.is_negative and goal.positive in state.literals:
+            return False
+        if not goal.is_negative and goal not in state.literals:
+            return False
+        return True
+    if isinstance(goal, LiteralConjunction):
+        return all(check_goal(state, lit) for lit in goal.literals)
+    prolog_interface = PrologInterface(state.literals, goal,
+        max_assignment_count=2,
+        allow_redundant_variables=True)
+    assignments = prolog_interface.run()
+    return len(assignments) > 0
 
 class CommitGoalError(Exception):
     pass
@@ -23,13 +51,14 @@ class CommitGoalError(Exception):
 class ProofSearchTree(object):
     def __init__(self, knowledge_base, allow_redundant_variables=True,
                  initial_assignments=None, allow_commit_exception=True,
-                 type_to_parent_types=None):
+                 type_to_parent_types=None, constants=None):
         self.knowledge_base = self.initialize_kb(knowledge_base)
         self.allow_redundant_variables = allow_redundant_variables
         self.goal_literals = []
         self.initial_assignments = initial_assignments
         self.allow_commit_exception = allow_commit_exception
         self.type_to_parent_types = type_to_parent_types
+        self.constants = constants or []
 
     def initialize_kb(self, knowledge_base):
         self.all_atoms = set()
@@ -52,7 +81,7 @@ class ProofSearchTree(object):
                     "Duplicate variables in predicates not supported."
         goal_literals = self.goal_literals+goal_literals
 
-        self.root = {'variable_assignments' : {}}
+        self.root = {'variable_assignments' : {c : c for c in self.constants}}
         self.queue = [self.root]
 
         all_assignments = []
