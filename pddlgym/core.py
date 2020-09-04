@@ -15,21 +15,24 @@ Usage example:
 >>> action = env.action_space.sample()
 >>> obs, reward, done, debug_info = env.step(action)
 """
+# --------------pddlgym---------------
+import gym
+from flatland.core.env_observation_builder import ObservationBuilder
+from flatland.envs.observations import GlobalObsForRailEnv
+
 from pddlgym.parser import PDDLDomainParser, PDDLProblemParser, PDDLParser
 from pddlgym.inference import find_satisfying_assignments
 from pddlgym.structs import ground_literal, Literal, State, ProbabilisticEffect, LiteralConjunction
 from pddlgym.spaces import LiteralSpace, LiteralSetSpace, LiteralActionSpace
 from pddlgym.planning import get_fd_optimal_plan_cost, get_pyperplan_heuristic
-
+# ---------------flatland--------------
+from flatland.envs.rail_env import RailEnv, RailEnvActions
+# ---------------functional-------------
 import pyperplan
-import copy
 import functools
 import glob
 import os
 import tempfile
-
-import gym
-
 import numpy as np
 
 TMP_PDDL_DIR = "/dev/shm" if os.path.exists("/dev/shm") else None
@@ -83,7 +86,7 @@ def _apply_effects(state, lifted_effects, assignments):
     return state.with_literals(new_literals)
 
 
-def _make_heuristic(domain_file, problem, mode, action_space,
+def _make_heuristic(domain_file, problem, mode, action_spaces,
                     cache_maxsize=10000):
     try:
         # generate a temporary file to hand over to pyperplan
@@ -91,7 +94,7 @@ def _make_heuristic(domain_file, problem, mode, action_space,
         initial_state = problem.initial_state
         # Add action literals to initial state so pyperplan works
         action_lits = set(
-            action_space.all_ground_literals(problem, valid_only=False))
+            action_spaces.all_ground_literals(problem, valid_only=False))
         initial_state |= action_lits
         with os.fdopen(pyp, "w") as f:
             problem.write(f, initial_state=initial_state,
@@ -124,7 +127,439 @@ def _make_heuristic(domain_file, problem, mode, action_space,
     return _call_heuristic
 
 
-class PDDLEnv(gym.Env):
+class PDDLEnv(RailEnv):
+    """
+    Parameters
+    ----------
+    domain_file : str
+        Path to a PDDL domain file.
+    problem_dir : str
+        Path to a directory of PDDL problem files.
+    render : fn or None
+        An optional render function (obs -> img).
+    seed : int
+        Random seed used to sample new problems upon reset.
+    raise_error_on_invalid_action : bool
+        When an action is taken for which no operator's
+        preconditions holds, raise InvalidAction() if True;
+        otherwise silently make no changes to the state.
+    operators_as_actions : bool
+        If True, the PDDL operators are treated as the actions.
+        Otherwise, actions must be specified separately in the PDDL file.
+    dynamic_action_spaces : bool
+        Let self.action_spaces dynamically change on each iteration to
+        include only valid actions (must match operator preconditions).
+    shape_reward_mode : Method for reward shaping.
+        - None: no reward shaping is done.
+        - "optimal": Evaluates the current state against the distance to goal
+                     given by an optimal planner. Gives rewards in the range
+                     (-inf, 1), with 1 for the goal state and 0 for the
+                     initial state.
+        - any heuristic in pyperplan.HEURISTICS:
+              https://github.com/aibasel/pyperplan/tree/master/src/heuristics
+              e.g., "blind", "hadd", "hff", "hmax", "hsa", "lmcut"
+              Note that "blind" is equivalent to None.
+              Note that "landmark" is path-dependent and so disallowed.
+              Gives rewards in the range (-inf, 1), with 1 for the goal state
+              and 0 for the initial state.
+    """
+
+    def __init__(self, width,
+                 height,
+                 rail_generator=None,
+                 schedule_generator=None,  # : sched_gen.ScheduleGenerator = sched_gen.random_schedule_generator(),
+                 number_of_agents=1,
+                 obs_builder_object: ObservationBuilder = GlobalObsForRailEnv(),
+                 malfunction_generator_and_process_data=None,  # mal_gen.no_malfunction_generator(),
+                 remove_agents_at_target=True,
+                 random_seed=1,
+                 record_steps=False,
+                 domain_file="./pddl/flatland.pddl",
+                 problem_dir="./pddl/flatland/",
+                 render=None,
+                 seed=0,
+                 raise_error_on_invalid_action=False,
+                 operators_as_actions=True,
+                 dynamic_action_space=False,
+                 durative_action=True,
+                 shape_reward_mode=None,
+                 shaping_discount=1.):
+        super().__init__(width, height, rail_generator, schedule_generator, number_of_agents,
+                                      obs_builder_object, malfunction_generator_and_process_data,
+                                      remove_agents_at_target, random_seed, record_steps)
+        self._state = None
+        self._domain_file = domain_file
+        self._problem_dir = problem_dir
+        self._render = render
+        self.seed(seed)
+        self._raise_error_on_invalid_action = raise_error_on_invalid_action
+        self.operators_as_actions = operators_as_actions
+
+        if shape_reward_mode == "none":
+            shape_reward_mode = None
+        self._shape_reward_mode = shape_reward_mode
+        self._shaping_discount = shaping_discount
+        self._current_heuristic = None
+        self._heuristic = None
+
+        # Set by self.fix_problem_index
+        self._problem_index_fixed = False
+
+        self._problem_idx = None
+
+        # Parse the PDDL files
+        self.domain, self.problems = self.load_pddl(domain_file, problem_dir,
+                                                    operators_as_actions=self.operators_as_actions)
+        self.durative_action = durative_action
+        # Initialize action space with problem-independent components
+        actions = list(self.domain.actions)
+        self.action_predicates = [self.domain.predicates[a] for a in actions]
+        if dynamic_action_space:
+            if self.domain.operators_as_actions:
+                self._action_spaces = LiteralActionSpace(
+                    self.domain, self.action_predicates,
+                    type_hierarchy=self.domain.type_hierarchy,
+                    type_to_parent_types=self.domain.type_to_parent_types)
+            else:
+                self._action_spaces = LiteralSpace(
+                    self.action_predicates, lit_valid_test=self._action_valid_test,
+                    type_hierarchy=self.domain.type_hierarchy,
+                    type_to_parent_types=self.domain.type_to_parent_types)
+
+        else:
+            self._action_spaces = LiteralSpace(self.action_predicates,
+                                              type_to_parent_types=self.domain.type_to_parent_types)
+
+        # Initialize observation space with problem-independent components
+        self._observation_space = LiteralSetSpace(
+            set(self.domain.predicates.values()) - set(self.action_predicates),
+            type_hierarchy=self.domain.type_hierarchy,
+            type_to_parent_types=self.domain.type_to_parent_types)
+
+    @staticmethod
+    def load_pddl(domain_file, problem_dir, operators_as_actions=False):
+        """
+        Parse domain and problem PDDL files.
+
+        Parameters
+        ----------
+        domain_file : str
+            Path to a PDDL domain file.
+        problem_dir : str
+            Path to a directory of PDDL problem files.
+        operators_as_actions : bool
+            See class docstirng.
+
+        Returns
+        -------
+        domain : PDDLDomainParser
+        problems : [ PDDLProblemParser ]
+        """
+        domain = PDDLDomainParser(domain_file,
+                                  expect_action_preds=(not operators_as_actions),
+                                  operators_as_actions=operators_as_actions)
+        problems = []
+        problem_files = [f for f in glob.glob(os.path.join(problem_dir, "*.pddl"))]
+        for problem_file in sorted(problem_files):
+            problem = PDDLProblemParser(problem_file, domain.domain_name,
+                                        domain.types, domain.predicates, domain.actions)
+            problems.append(problem)
+        return domain, problems
+
+    @property
+    def observation_space(self):
+        return self._observation_space
+
+    @property
+    def action_spaces(self):
+        return self._action_spaces
+
+    def set_state(self, state):
+        self._state = state
+        if self._shape_reward_mode is not None:
+            self._current_heuristic = self.compute_heuristic(state)
+
+    def get_state(self):
+        return self._state
+
+    def seed(self, seed):
+        self._seed = seed
+        self.rng = np.random.RandomState(seed)
+
+    def fix_problem_index(self, problem_idx):
+        """
+        Fix the PDDL problem used when reset is called.
+
+        Useful for reproducible testing.
+
+        The order of PDDL problems is determined by the names
+        of their files. See PDDLEnv.load_pddl.
+
+        Parameters
+        ----------
+        problem_idx : int
+        """
+        if problem_idx != self._problem_idx:
+            # Problem is changing, force ourselves to recompute heuristic
+            self._heuristic = None
+        self._problem_idx = problem_idx
+        self._problem_index_fixed = True
+
+    def reset(self):
+        """
+        Set up a new PDDL problem and start a new episode.
+
+        Note that the PDDL files are included in debug_info.
+
+        Returns
+        -------
+        obs : { Literal }
+            The set of active predicates.
+        debug_info : dict
+            See self._get_debug_info()
+        """
+        if not self._problem_index_fixed:
+            # Problem is changing, force ourselves to recompute heuristic
+            self._heuristic = None
+            self._problem_idx = self.rng.choice(len(self.problems))
+        self._problem = self.problems[self._problem_idx]
+
+        # Create new heuristic if using reward shaping and either the problem
+        # isn't fixed or no heuristic has been created yet.
+        if (self._shape_reward_mode is not None
+                and self._shape_reward_mode != "optimal"
+                and self._heuristic is None):
+            self._heuristic = self.make_heuristic_function(self._shape_reward_mode)
+
+        # reset the current heuristic
+        self._current_heuristic = None
+        initial_state = State(frozenset(self._problem.initial_state),
+                              frozenset(self._problem.objects),
+                              self._problem.goal)
+        self.set_state(initial_state)
+
+        self._goal = self._problem.goal
+        debug_info = self._get_debug_info()
+        super(PDDLEnv, self).reset()
+        return self.get_state(), debug_info
+
+    def make_heuristic_function(self, mode):
+        return _make_heuristic(
+            self._domain_file,
+            self._problem,
+            mode=mode,
+            action_spaces=self.action_spaces,
+        )
+
+    def _get_debug_info(self):
+        """
+        Contains the problem file and domain file
+        for interaction with a planner.
+        """
+        info = {'problem_file': self._problem.problem_fname,
+                'domain_file': self.domain.domain_fname}
+        return info
+
+    def _select_operator(self, state, action):
+        """
+        Helper function for step.
+        """
+        if self.operators_as_actions:
+            # There should be only one possible operator if actions are operators
+            possible_operators = set()
+            for name, operator in self.domain.operators.items():
+                if name.lower() == action.predicate.name.lower():
+                    assert len(possible_operators) == 0
+                    possible_operators.add(operator)
+        else:
+            # Possibly multiple operators per action
+            possible_operators = set(self.domain.operators.values())
+
+        # Knowledge base: literals in the state + action taken
+        kb = set(state.literals) | {action}
+
+        selected_operator = None
+        assignment = None
+
+        if self.durative_action:
+            for operator in possible_operators:
+                if isinstance(operator.conditions, Literal):
+                    conds = [operator.conditions]
+                else:
+                    conds = operator.conditions.literals
+                # Necessary for binding the operator arguments to the variables
+                if self.operators_as_actions:
+                    conds = [action.predicate(*operator.params)] + conds
+                # Check whether action is in the preconditions
+                action_literal = None
+                for lit in conds:
+                    if lit.predicate == action.predicate:
+                        action_literal = lit
+                        break
+                if action_literal is None:
+                    continue
+                # For proving, consider action variable first
+                action_variables = action_literal.variables
+                variable_sort_fn = lambda v: (not v in action_variables, v)
+                assignments = find_satisfying_assignments(kb, conds,
+                                                          variable_sort_fn=variable_sort_fn,
+                                                          type_to_parent_types=self.domain.type_to_parent_types)
+                num_assignments = len(assignments)
+                if num_assignments > 0:
+                    assert num_assignments == 1, "Nondeterministic envs not supported"
+                    selected_operator = operator
+                    assignment = assignments[0]
+                    break
+        else:
+            for operator in possible_operators:
+                if isinstance(operator.preconds, Literal):
+                    conds = [operator.preconds]
+                else:
+                    conds = operator.preconds.literals
+                # Necessary for binding the operator arguments to the variables
+                if self.operators_as_actions:
+                    conds = [action.predicate(*operator.params)] + conds
+                # Check whether action is in the preconditions
+                action_literal = None
+                for lit in conds:
+                    if lit.predicate == action.predicate:
+                        action_literal = lit
+                        break
+                if action_literal is None:
+                    continue
+                # For proving, consider action variable first
+                action_variables = action_literal.variables
+                variable_sort_fn = lambda v: (not v in action_variables, v)
+                assignments = find_satisfying_assignments(kb, conds,
+                                                          variable_sort_fn=variable_sort_fn,
+                                                          type_to_parent_types=self.domain.type_to_parent_types)
+                num_assignments = len(assignments)
+                if num_assignments > 0:
+                    assert num_assignments == 1, "Nondeterministic envs not supported"
+                    selected_operator = operator
+                    assignment = assignments[0]
+                    break
+
+        return selected_operator, assignment
+
+    def step(self, action):
+        """
+        Execute an action and update the state.
+
+        Tries to find a ground operator for which the
+        preconditions hold when this action is taken. If none
+        exist, optionally raises InvalidAction. If multiple
+        exist, raises an AssertionError, since we assume
+        deterministic environments only. Once the operator
+        is found, the ground effects are executed to update
+        the state.
+
+        Parameters
+        ----------
+        action : Literal
+
+        Returns
+        -------
+        state : State
+            The set of active predicates.
+        reward : float
+            1 if the goal is reached and 0 otherwise.
+        done : bool
+            True if the goal is reached.
+        debug_info : dict
+            See self._get_debug_info.
+        """
+
+        state, reward, done, debug_info = self.sample_transition(action)
+        self.set_state(state)
+        if "next_state_heuristic" in debug_info:
+            self._current_heuristic = debug_info["next_state_heuristic"]
+        return state, reward, done, debug_info
+
+    def sample_transition(self, action):
+        selected_operator, assignment = self._select_operator(self._state,
+                                                              action)
+        state = self._state
+
+        # A ground operator was found; execute the ground effects
+        if assignment is not None:
+            state = _apply_effects(
+                self._state,
+                selected_operator.effects.literals,
+                assignment,
+            )
+
+        # No operator was found
+        elif self._raise_error_on_invalid_action:
+            raise InvalidAction()
+
+        done = self._is_goal_reached(state)
+
+        reward = self.extrinsic_reward(state, done)
+        debug_info = self._get_debug_info()
+        next_obs, all_rewards, done, info = super().step(action)
+
+        # add intrinsic reward
+        if self._shape_reward_mode:
+            next_heuristic = 0. if done else self.compute_heuristic(state)
+            reward += self._current_heuristic - next_heuristic * self._shaping_discount
+            debug_info["next_state_heuristic"] = next_heuristic
+
+        return state, reward, done, debug_info
+
+    def extrinsic_reward(self, state, done):
+        if done:
+            reward = 1.
+        else:
+            reward = 0.
+
+        return reward
+
+    def compute_heuristic(self, state):
+        """Compute the heuristic for a given state in the current problem.
+        """
+        if self._shape_reward_mode == "optimal":
+            problem = self.problems[self._problem_idx]
+
+            # Add action literals to state to enable planning
+            state_lits = set(state.literals)
+            action_lits = set(
+                self.action_spaces.all_ground_literals(state, valid_only=False))
+            state_lits |= action_lits
+
+            problem_path = ""
+            try:
+                # generate a temporary file to hand over to the external planner
+                fd, problem_path = tempfile.mkstemp(dir=TMP_PDDL_DIR, text=True)
+                with os.fdopen(fd, "w") as f:
+                    problem.write(f, initial_state=state_lits, fast_downward_order=True)
+
+                return get_fd_optimal_plan_cost(
+                    self.domain.domain_fname, problem_path)
+            finally:
+                try:
+                    os.remove(problem_path)
+                except FileNotFoundError:
+                    pass
+        else:
+            return self._heuristic(state)
+
+    def _is_goal_reached(self, state):
+        """
+        Check if the terminal condition is met, i.e., the goal is reached.
+        """
+        return self._goal.holds(state.literals)
+
+    def _action_valid_test(self, state, action):
+        _, assignment = self._select_operator(state, action)
+        return assignment is not None
+
+    def render(self, *args, **kwargs):
+        if self._render:
+            return self._render(self._state.literals, *args, **kwargs)
+
+
+class PDDLOriginEnv(gym.Env):
     """
     Parameters
     ----------
@@ -190,11 +625,15 @@ class PDDLEnv(gym.Env):
         self.domain, self.problems = self.load_pddl(domain_file, problem_dir,
             operators_as_actions=self.operators_as_actions)
 
+        # Determine if the domain is STRIPS
+        self._domain_is_strips = self._check_domain_for_strips(self.domain)
+        self._inference_mode = "csp" if self._domain_is_strips else "prolog"
+
         # Initialize action space with problem-independent components
         actions = list(self.domain.actions)
         self.action_predicates = [self.domain.predicates[a] for a in actions]
         if dynamic_action_space:
-            if self.domain.operators_as_actions:
+            if self.domain.operators_as_actions and self._domain_is_strips:
                 self._action_space = LiteralActionSpace(
                     self.domain, self.action_predicates,
                     type_hierarchy=self.domain.type_hierarchy,
@@ -219,7 +658,6 @@ class PDDLEnv(gym.Env):
     def load_pddl(domain_file, problem_dir, operators_as_actions=False):
         """
         Parse domain and problem PDDL files.
-
         Parameters
         ----------
         domain_file : str
@@ -228,20 +666,19 @@ class PDDLEnv(gym.Env):
             Path to a directory of PDDL problem files.
         operators_as_actions : bool
             See class docstirng.
-
         Returns
         -------
         domain : PDDLDomainParser
         problems : [ PDDLProblemParser ]
         """
-        domain = PDDLDomainParser(domain_file, 
+        domain = PDDLDomainParser(domain_file,
             expect_action_preds=(not operators_as_actions),
             operators_as_actions=operators_as_actions)
         problems = []
         problem_files = [f for f in glob.glob(os.path.join(problem_dir, "*.pddl"))]
         for problem_file in sorted(problem_files):
-            problem = PDDLProblemParser(problem_file, domain.domain_name, 
-                domain.types, domain.predicates, domain.actions)
+            problem = PDDLProblemParser(problem_file, domain.domain_name,
+                domain.types, domain.predicates, domain.actions, domain.constants)
             problems.append(problem)
         return domain, problems
 
@@ -268,12 +705,9 @@ class PDDLEnv(gym.Env):
     def fix_problem_index(self, problem_idx):
         """
         Fix the PDDL problem used when reset is called.
-
         Useful for reproducible testing.
-
         The order of PDDL problems is determined by the names
         of their files. See PDDLEnv.load_pddl.
-
         Parameters
         ----------
         problem_idx : int
@@ -287,9 +721,7 @@ class PDDLEnv(gym.Env):
     def reset(self):
         """
         Set up a new PDDL problem and start a new episode.
-
         Note that the PDDL files are included in debug_info.
-
         Returns
         -------
         obs : { Literal }
@@ -369,7 +801,7 @@ class PDDLEnv(gym.Env):
                 conds = [action.predicate(*operator.params)] + conds
             # Check whether action is in the preconditions
             action_literal = None
-            for lit in conds: 
+            for lit in conds:
                 if lit.predicate == action.predicate:
                     action_literal = lit
                     break
@@ -380,7 +812,9 @@ class PDDLEnv(gym.Env):
             variable_sort_fn = lambda v : (not v in action_variables, v)
             assignments = find_satisfying_assignments(kb, conds,
                 variable_sort_fn=variable_sort_fn,
-                type_to_parent_types=self.domain.type_to_parent_types)
+                type_to_parent_types=self.domain.type_to_parent_types,
+                constants=self.domain.constants,
+                mode=self._inference_mode)
             num_assignments = len(assignments)
             if num_assignments > 0:
                 assert num_assignments == 1, "Nondeterministic envs not supported"
@@ -393,19 +827,16 @@ class PDDLEnv(gym.Env):
     def step(self, action):
         """
         Execute an action and update the state.
-
-        Tries to find a ground operator for which the 
+        Tries to find a ground operator for which the
         preconditions hold when this action is taken. If none
         exist, optionally raises InvalidAction. If multiple
         exist, raises an AssertionError, since we assume
         deterministic environments only. Once the operator
         is found, the ground effects are executed to update
         the state.
-
         Parameters
         ----------
         action : Literal
-
         Returns
         -------
         state : State
@@ -430,9 +861,16 @@ class PDDLEnv(gym.Env):
 
         # A ground operator was found; execute the ground effects
         if assignment is not None:
+            # Get operator effects
+            if isinstance(selected_operator.effects, LiteralConjunction):
+                effects = selected_operator.effects.literals
+            else:
+                assert isinstance(selected_operator.effects, Literal)
+                effects = [selected_operator.effects]
+
             state = _apply_effects(
                 self._state,
-                selected_operator.effects.literals,
+                effects,
                 assignment,
             )
 
@@ -494,7 +932,20 @@ class PDDLEnv(gym.Env):
         """
         Check if the terminal condition is met, i.e., the goal is reached.
         """
-        return self._goal.holds(state.literals)
+        return check_goal(state, self._goal)
+
+    def _check_domain_for_strips(self, domain):
+        for operator in domain.operators.values():
+            if not self._check_struct_for_strips(operator.preconds):
+                return False
+        return True
+
+    def _check_struct_for_strips(self, struct):
+        if isinstance(struct, Literal):
+            return True
+        if isinstance(struct, LiteralConjunction):
+            return all(self._check_struct_for_strips(l) for l in struct.literals)
+        return False
 
     def _action_valid_test(self, state, action):
         _, assignment = self._select_operator(state, action)
@@ -503,3 +954,315 @@ class PDDLEnv(gym.Env):
     def render(self, *args, **kwargs):
         if self._render:
             return self._render(self._state.literals, *args, **kwargs)
+
+
+class PDDLFakeEnv:
+    """
+    Parameters
+    ----------
+    domain_file : str
+        Path to a PDDL domain file.
+    problem_dir : str
+        Path to a directory of PDDL problem files.
+    render : fn or None
+        An optional render function (obs -> img).
+    seed : int
+        Random seed used to sample new problems upon reset.
+    raise_error_on_invalid_action : bool
+        When an action is taken for which no operator's
+        preconditions holds, raise InvalidAction() if True;
+        otherwise silently make no changes to the state.
+    operators_as_actions : bool
+        If True, the PDDL operators are treated as the actions.
+        Otherwise, actions must be specified separately in the PDDL file.
+    dynamic_action_space : bool
+        Let self.action_space dynamically change on each iteration to
+        include only valid actions (must match operator preconditions).
+    shape_reward_mode : Method for reward shaping.
+        - None: no reward shaping is done.
+        - "optimal": Evaluates the current state against the distance to goal
+                     given by an optimal planner. Gives rewards in the range
+                     (-inf, 1), with 1 for the goal state and 0 for the
+                     initial state.
+        - any heuristic in pyperplan.HEURISTICS:
+              https://github.com/aibasel/pyperplan/tree/master/src/heuristics
+              e.g., "blind", "hadd", "hff", "hmax", "hsa", "lmcut"
+              Note that "blind" is equivalent to None.
+              Note that "landmark" is path-dependent and so disallowed.
+              Gives rewards in the range (-inf, 1), with 1 for the goal state
+              and 0 for the initial state.
+    """
+
+    def __init__(self, domain_file="./pddl/flatland.pddl",
+                 problem_dir="./pddl/flatland/",
+                 raise_error_on_invalid_action=False,
+                 operators_as_actions=True,
+                 dynamic_action_space=False,
+                 shape_reward_mode=None,
+                 shaping_discount=1.):
+        self._state = None
+        self._domain_file = domain_file
+        self._problem_dir = problem_dir
+        self._raise_error_on_invalid_action = raise_error_on_invalid_action
+        self.operators_as_actions = operators_as_actions
+
+        if shape_reward_mode == "none":
+            shape_reward_mode = None
+        self._shape_reward_mode = shape_reward_mode
+        self._shaping_discount = shaping_discount
+        self._current_heuristic = None
+        self._heuristic = None
+
+        # Set by self.fix_problem_index
+        self._problem_index_fixed = False
+
+        self._problem_idx = None
+
+        # Parse the PDDL files
+        self.domain, self.problems = self.load_pddl(domain_file, problem_dir,
+                                                    operators_as_actions=self.operators_as_actions)
+
+        # Initialize action space with problem-independent components
+        actions = list(self.domain.actions)
+        self.action_predicates = [self.domain.predicates[a] for a in actions]
+        if dynamic_action_space:
+            if self.domain.operators_as_actions:
+                self._action_space = LiteralActionSpace(
+                    self.domain, self.action_predicates,
+                    type_hierarchy=self.domain.type_hierarchy,
+                    type_to_parent_types=self.domain.type_to_parent_types)
+            else:
+                self._action_space = LiteralSpace(
+                    self.action_predicates, lit_valid_test=self._action_valid_test,
+                    type_hierarchy=self.domain.type_hierarchy,
+                    type_to_parent_types=self.domain.type_to_parent_types)
+
+        else:
+            self._action_space = LiteralSpace(self.action_predicates,
+                                              type_to_parent_types=self.domain.type_to_parent_types)
+
+        # Initialize observation space with problem-independent components
+        self._observation_space = LiteralSetSpace(
+            set(self.domain.predicates.values()) - set(self.action_predicates),
+            type_hierarchy=self.domain.type_hierarchy,
+            type_to_parent_types=self.domain.type_to_parent_types)
+
+    @staticmethod
+    def load_pddl(domain_file, problem_dir, operators_as_actions=True):
+        """
+        Parse domain and problem PDDL files.
+
+        Parameters
+        ----------
+        domain_file : str
+            Path to a PDDL domain file.
+        problem_dir : str
+            Path to a directory of PDDL problem files.
+        operators_as_actions : bool
+            See class docstirng.
+
+        Returns
+        -------
+        domain : PDDLDomainParser
+        problems : [ PDDLProblemParser ]
+        """
+        domain = PDDLDomainParser(domain_file,
+                                  expect_action_preds=(not operators_as_actions),
+                                  operators_as_actions=operators_as_actions)
+        problems = []
+        problem_files = [f for f in glob.glob(os.path.join(problem_dir, "*.pddl"))]
+        assert len(problem_files) != 0, "Not found *.pddl in {}".format(problem_dir)
+        for problem_file in sorted(problem_files):
+            problem = PDDLProblemParser(problem_file, domain.domain_name,
+                                        domain.types, domain.predicates, domain.actions)
+            problems.append(problem)
+        return domain, problems
+
+    @property
+    def observation_space(self):
+        return self._observation_space
+
+    @property
+    def action_spaces(self):
+        return self._action_space
+
+    def set_state(self, state):
+        self._state = state
+        if self._shape_reward_mode is not None:
+            self._current_heuristic = self.compute_heuristic(state)
+
+    def get_state(self):
+        return self._state
+
+    def fix_problem_index(self, problem_idx):
+        """
+        Fix the PDDL problem used when reset is called.
+
+        Useful for reproducible testing.
+
+        The order of PDDL problems is determined by the names
+        of their files. See PDDLEnv.load_pddl.
+
+        Parameters
+        ----------
+        problem_idx : int
+        """
+        if problem_idx != self._problem_idx:
+            # Problem is changing, force ourselves to recompute heuristic
+            self._heuristic = None
+        self._problem_idx = problem_idx
+        self._problem_index_fixed = True
+
+    def make_heuristic_function(self, mode):
+        return _make_heuristic(
+            self._domain_file,
+            self._problem,
+            mode=mode,
+            action_space=self.action_spaces,
+        )
+
+    def _get_debug_info(self):
+        """
+        Contains the problem file and domain file
+        for interaction with a planner.
+        """
+        info = {'problem_file': self._problem.problem_fname,
+                'domain_file': self.domain.domain_fname}
+        return info
+
+    def reset(self):
+        """
+        Set up a new PDDL problem and start a new episode.
+
+        Note that the PDDL files are included in debug_info.
+
+        Returns
+        -------
+        obs : { Literal }
+            The set of active predicates.
+        debug_info : dict
+            See self._get_debug_info()
+        """
+        if not self._problem_index_fixed:
+            # Problem is changing, force ourselves to recompute heuristic
+            self._heuristic = None
+            self._problem_idx = self.rng.choice(len(self.problems))
+        self._problem = self.problems[self._problem_idx]
+
+        # Create new heuristic if using reward shaping and either the problem
+        # isn't fixed or no heuristic has been created yet.
+        if (self._shape_reward_mode is not None
+                and self._shape_reward_mode != "optimal"
+                and self._heuristic is None):
+            self._heuristic = self.make_heuristic_function(self._shape_reward_mode)
+
+        # reset the current heuristic
+        self._current_heuristic = None
+        initial_state = State(frozenset(self._problem.initial_state),
+                              frozenset(self._problem.objects),
+                              self._problem.goal)
+        self.set_state(initial_state)
+
+        self._goal = self._problem.goal
+        debug_info = self._get_debug_info()
+
+        return self.get_state(), debug_info
+
+    def _select_operator(self, state, action):
+        """
+        Helper function for step.
+        """
+        if self.operators_as_actions:
+            # There should be only one possible operator if actions are operators
+            possible_operators = set()
+            for name, operator in self.domain.operators.items():
+                if name.lower() == action.predicate.name.lower():
+                    assert len(possible_operators) == 0
+                    possible_operators.add(operator)
+        else:
+            # Possibly multiple operators per action
+            possible_operators = set(self.domain.operators.values())
+
+        # Knowledge base: literals in the state + action taken
+        kb = set(state.literals) | {action}
+
+        selected_operator = None
+        assignment = None
+        for operator in possible_operators:
+            if isinstance(operator.preconds, Literal):
+                conds = [operator.preconds]
+            else:
+                conds = operator.preconds.literals
+            # Necessary for binding the operator arguments to the variables
+            if self.operators_as_actions:
+                conds = [action.predicate(*operator.params)] + conds
+            # Check whether action is in the preconditions
+            action_literal = None
+            for lit in conds:
+                if lit.predicate == action.predicate:
+                    action_literal = lit
+                    break
+            if action_literal is None:
+                continue
+            # For proving, consider action variable first
+            action_variables = action_literal.variables
+            variable_sort_fn = lambda v: (not v in action_variables, v)
+            assignments = find_satisfying_assignments(kb, conds,
+                                                      variable_sort_fn=variable_sort_fn,
+                                                      type_to_parent_types=self.domain.type_to_parent_types)
+            num_assignments = len(assignments)
+            if num_assignments > 0:
+                assert num_assignments == 1, "Nondeterministic envs not supported"
+                selected_operator = operator
+                assignment = assignments[0]
+                break
+
+        return selected_operator, assignment
+
+    def extrinsic_reward(self, state, done):
+        if done:
+            reward = 1.
+        else:
+            reward = 0.
+
+        return reward
+
+    def compute_heuristic(self, state):
+        """Compute the heuristic for a given state in the current problem.
+        """
+        if self._shape_reward_mode == "optimal":
+            problem = self.problems[self._problem_idx]
+
+            # Add action literals to state to enable planning
+            state_lits = set(state.literals)
+            action_lits = set(
+                self.action_spaces.all_ground_literals(state, valid_only=False))
+            state_lits |= action_lits
+
+            problem_path = ""
+            try:
+                # generate a temporary file to hand over to the external planner
+                fd, problem_path = tempfile.mkstemp(dir=TMP_PDDL_DIR, text=True)
+                with os.fdopen(fd, "w") as f:
+                    problem.write(f, initial_state=state_lits, fast_downward_order=True)
+
+                return get_fd_optimal_plan_cost(
+                    self.domain.domain_fname, problem_path)
+            finally:
+                try:
+                    os.remove(problem_path)
+                except FileNotFoundError:
+                    pass
+        else:
+            return self._heuristic(state)
+
+    def _is_goal_reached(self, state):
+        """
+        Check if the terminal condition is met, i.e., the goal is reached.
+        """
+        return self._goal.holds(state.literals)
+
+    def _action_valid_test(self, state, action):
+        _, assignment = self._select_operator(state, action)
+        return assignment is not None
+

@@ -1,7 +1,9 @@
 """Utilities
 """
+from flatland.utils.rendertools import RenderTool
+
 from pddlgym.planning import run_planner
-from pddlgym.parser import parse_plan_step, PDDLDomainParser, PDDLProblemParser
+from pddlgym.parser import parse_plan_step, PDDLDomainParser, PDDLProblemParser, parse_plan_step_lpg
 from PIL import Image
 
 from collections import defaultdict
@@ -14,7 +16,7 @@ import gym
 import imageio
 
 
-def run_random_agent_demo(env, outdir='/tmp', max_num_steps=10, fps=3, 
+def run_random_agent_demo(env, outdir='/tmp', max_num_steps=10, fps=3,
                           verbose=False, seed=None):
     if outdir is None:
         outdir = "/tmp/{}".format(env_cls.__name__)
@@ -36,7 +38,7 @@ def run_random_agent_demo(env, outdir='/tmp', max_num_steps=10, fps=3,
     for t in range(max_num_steps):
         if verbose:
             print("Obs:", obs)
-    
+
         action = env.action_space.sample(obs)
         if verbose:
             print("Act:", action)
@@ -56,6 +58,7 @@ def run_random_agent_demo(env, outdir='/tmp', max_num_steps=10, fps=3,
     env.close()
     if verbose:
         input("press enter to continue to next problem")
+
 
 def run_planning_demo(env, planner_name, outdir='/tmp', fps=3, verbose=False, seed=None, check_reward=True):
     if outdir is None:
@@ -82,19 +85,19 @@ def run_planning_demo(env, planner_name, outdir='/tmp', fps=3, verbose=False, se
     actions = []
     for s in plan:
         a = parse_plan_step(
-                s, 
-                env.domain.operators.values(), 
-                env.action_predicates,
-                obs.objects, 
-                operators_as_actions=env.operators_as_actions
-            )
+            s,
+            env.domain.operators.values(),
+            env.action_predicates,
+            obs.objects,
+            operators_as_actions=env.operators_as_actions
+        )
         actions.append(a)
-    
+
     tot_reward = 0.
     for action in actions:
         if verbose:
             print("Obs:", obs)
-    
+
         if verbose:
             print("Act:", action)
 
@@ -117,6 +120,150 @@ def run_planning_demo(env, planner_name, outdir='/tmp', fps=3, verbose=False, se
     if verbose:
         input("press enter to continue to next problem")
     return tot_reward
+
+
+def run_planning_demo(env, planner_name, outdir='/tmp', fps=3, verbose=False, seed=None, check_reward=True):
+    if outdir is None:
+        outdir = "/tmp/{}".format(env_cls.__name__)
+        if not os.path.exists(outdir):
+            os.makedirs(outdir)
+
+    if env._render:
+        if env._problem_index_fixed:
+            problem_idx = env._problem_idx
+            video_path = os.path.join(outdir, 'planning_{}_{}_{}_demo.gif'.format(
+                planner_name, env.spec.id, problem_idx))
+        else:
+            video_path = os.path.join(outdir, 'planning_{}_{}_demo.gif'.format(
+                planner_name, env.spec.id))
+        env = VideoWrapper(env, video_path, fps=fps)
+
+    if seed is not None:
+        env.seed(seed)
+
+    obs, debug_info = env.reset()
+    plan = run_planner(debug_info['domain_file'], debug_info['problem_file'], planner_name)
+
+    actions = []
+    for s in plan:
+        a = parse_plan_step(
+            s,
+            env.domain.operators.values(),
+            env.action_predicates,
+            obs.objects,
+            operators_as_actions=env.operators_as_actions
+        )
+        actions.append(a)
+
+    tot_reward = 0.
+    for action in actions:
+        if verbose:
+            print("Obs:", obs)
+
+        if verbose:
+            print("Act:", action)
+
+        obs, reward, done, _ = env.step(action)
+        env.render()
+        tot_reward += reward
+        if verbose:
+            print("Rew:", reward)
+
+        if done:
+            break
+
+    if verbose:
+        print("Final obs:", obs)
+        print()
+
+    env.close()
+    if check_reward:
+        assert tot_reward > 0
+    if verbose:
+        input("press enter to continue to next problem")
+    return tot_reward
+
+
+def run_planning_flatland_demo(env, planner_name, verbose=True, seed=None, check_reward=True):
+    if seed is not None:
+        env.seed(seed)
+
+    obs, debug_info = env.reset()
+    plan = run_planner(debug_info['domain_file'], debug_info['problem_file'], planner_name)
+
+    actions = []
+    for s in plan:
+        a = parse_plan_step(
+            s,
+            env.domain.operators.values(),
+            env.action_predicates,
+            obs.objects,
+            operators_as_actions=env.operators_as_actions
+        )
+        actions.append(a)
+
+    tot_reward = 0.
+    # action_dict = {}
+    action_arr = []
+    for agent in env.get_agent_handles():
+        for _ in actions:
+            action = np.random.choice(np.arange(4))
+            # action_dict.update({agent: action})
+            action_arr.append({agent:action})
+    if verbose:
+        env_renderer = RenderTool(env, gl="PGL")
+        env_renderer.set_new_rail()
+
+    for action in action_arr:
+        if verbose:
+            print("Obs:", obs)
+
+        if verbose:
+            print("Act:", action)
+
+        next_obs, all_rewards, done, info = env.step(action)
+        if verbose:
+            env_renderer.render_env(
+                show=True,
+                frames=False,
+                show_observations=False,
+                show_predictions=False
+            )
+        tot_reward += all_rewards[0]
+        if verbose:
+            print("Rew:", all_rewards)
+
+        if done[0]:
+            break
+
+    if verbose:
+        print("Final obs:", obs)
+        print()
+
+    env_renderer.close_window()
+    # if check_reward:
+    #     assert tot_reward > 0
+    # if verbose:
+    #     input("press enter to continue to next problem")
+    return tot_reward
+
+
+def run_planning_fake_demo(env, planner_name):
+    obs, debug_info = env.reset()
+    plan = run_planner(debug_info['domain_file'], debug_info['problem_file'], planner_name)
+
+    actions = []
+    for s in plan:
+        a = parse_plan_step_lpg(
+            s,
+            env.domain.operators.values(),
+            env.action_predicates,
+            obs.objects,
+            operators_as_actions=env.operators_as_actions
+        )
+        actions.append(a)
+
+    return actions
 
 
 def run_probabilistic_planning_demo(env, planner_name, verbose=False, num_epi=20, outdir='/tmp', fps=3):
@@ -149,12 +296,12 @@ def run_probabilistic_planning_demo(env, planner_name, verbose=False, num_epi=20
         actions = []
         for s in plan:
             a = parse_plan_step(
-                    s, 
-                    env.domain.operators.values(), 
-                    env.action_predicates,
-                    obs.objects, 
-                    operators_as_actions=env.operators_as_actions
-                )
+                s,
+                env.domain.operators.values(),
+                env.action_predicates,
+                obs.objects,
+                operators_as_actions=env.operators_as_actions
+            )
             actions.append(a)
 
         tot_reward = 0.
@@ -179,7 +326,7 @@ def run_probabilistic_planning_demo(env, planner_name, verbose=False, num_epi=20
             print("Got total reward:", tot_reward)
             print()
 
-        avg_reward += tot_reward/num_epi
+        avg_reward += tot_reward / num_epi
 
     print("Average reward over {} episodes was {}".format(num_epi, avg_reward))
     env.close()
@@ -209,7 +356,7 @@ class VideoWrapper(gym.Wrapper):
         self.observation_space = self.env.observation_space
 
         self.out_path = self.out_path_prefix + str(self.reset_count) + \
-            '.' + self.out_path_suffix
+                        '.' + self.out_path_suffix
         self.reset_count += 1
 
         self.images = []
